@@ -14,6 +14,9 @@ Flow:
 2. page bridge script runs in the page context and reads:
    - `movie_player.getPlayerResponse()`
    - `ytInitialPlayerResponse`
+   - `formats + adaptiveFormats`
+   - player JS for `signatureCipher` deciphering
+   - fetched watch-page HTML as a same-session fallback
    - active `video.currentSrc`
    - `youtubei/v1/player` as a same-page fallback
 3. background service worker uses `chrome.downloads.download()` to start the file download
@@ -47,6 +50,12 @@ Local fixture test for the full extension message chain:
 ```bash
 npm run test:fixture
 ```
+
+The fixture suite now covers:
+
+- direct progressive MP4 extraction
+- adaptive-format extraction with signature deciphering
+- watch-page HTML fallback when the current Shorts page has no usable player response
 
 ## Current Limitation
 

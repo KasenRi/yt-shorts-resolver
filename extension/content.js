@@ -86,7 +86,10 @@ function scoreFormat(format) {
 }
 
 function extractDirectFormats(response) {
-  const formats = Array.isArray(response?.streamingData?.formats) ? response.streamingData.formats : [];
+  const formats = [
+    ...(Array.isArray(response?.streamingData?.formats) ? response.streamingData.formats : []),
+    ...(Array.isArray(response?.streamingData?.adaptiveFormats) ? response.streamingData.adaptiveFormats : []),
+  ];
   return formats
     .map((format) => {
       const directUrl = format.url || simplifyCipherUrl(format);
