@@ -1,0 +1,26 @@
+{
+  "name": "yt-shorts-resolver",
+  "version": "1.0.0",
+  "description": "Tampermonkey + backend YouTube resolver with yt-dlp and upstream provider support.",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node src/server.js",
+    "start": "node src/server.js",
+    "e2e": "node scripts/run-e2e.mjs"
+  },
+  "keywords": [
+    "tampermonkey",
+    "youtube",
+    "yt-dlp",
+    "download",
+    "shorts"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "playwright": "^1.58.2"
+  }
+}
