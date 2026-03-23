@@ -1,90 +1,59 @@
 # yt-shorts-resolver
 
-Tampermonkey script + backend API for adding a `解析下载` button to YouTube pages.
+Single-tool Chrome extension branch for adding a `解析下载` button directly inside YouTube.
 
-## What It Does
+Branch: `feature/chrome-extension`
 
-- Injects a `解析下载` button next to the YouTube action bar.
-- Calls your backend at `POST /api/resolve`.
-- On success, opens the resolved media URL in a new tab.
+## Approach
 
-## Architecture
+This branch removes the VPS dependency. The extension resolves media links inside the user's own YouTube tab by using the page's own session, cookies, and player state.
 
-- Client: [tampermonkey/youtube-download.user.js](/home/ribon/yt-shorts-resolver/tampermonkey/youtube-download.user.js)
-- Server: [src/server.js](/home/ribon/yt-shorts-resolver/src/server.js)
-- Providers:
-  - `yt-dlp`
-  - `cobalt`
-  - `fixture` for UI testing only
+Flow:
 
-## Important Limitation
+1. content script injects a `解析下载` button next to the YouTube action bar
+2. page bridge script runs in the page context and reads:
+   - `movie_player.getPlayerResponse()`
+   - `ytInitialPlayerResponse`
+   - active `video.currentSrc`
+   - `youtubei/v1/player` as a same-page fallback
+3. background service worker uses `chrome.downloads.download()` to start the file download
 
-YouTube now aggressively blocks server-side extraction on many IPs. In practice, a stable deployment often needs at least one of these:
+## Files
 
-- browser cookies via `YTDLP_COOKIES_FILE`
-- `--cookies-from-browser` on the same machine
-- a cleaner residential / mobile proxy via `YTDLP_PROXY`
-- a self-hosted `cobalt` upstream with working session / poToken support
+- Extension manifest: [extension/manifest.json](/home/ribon/yt-shorts-resolver/extension/manifest.json)
+- Content script: [extension/content.js](/home/ribon/yt-shorts-resolver/extension/content.js)
+- Page bridge: [extension/page-bridge.js](/home/ribon/yt-shorts-resolver/extension/page-bridge.js)
+- Background worker: [extension/background.js](/home/ribon/yt-shorts-resolver/extension/background.js)
 
-On this machine, the provided Shorts URL hit YouTube's `Sign in to confirm you're not a bot` gate for raw server-side extraction, so the project is implemented as a deployable resolver with configurable backends rather than pretending that a clean unauthenticated server IP will always work.
+## Load In Chrome
 
-## Local Run
+1. Open `chrome://extensions`
+2. Enable `Developer mode`
+3. Click `Load unpacked`
+4. Select the [extension](/home/ribon/yt-shorts-resolver/extension) directory
 
-```bash
-npm install
-npm run dev
-```
+Then open a YouTube watch page or Shorts page and look for the `解析下载` button near the existing action buttons.
 
-Health check:
+## Tests
 
-```bash
-curl http://127.0.0.1:8787/health
-```
-
-Resolve:
+Real extension injection test against the provided Shorts URL:
 
 ```bash
-curl http://127.0.0.1:8787/api/resolve \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"https://youtube.com/shorts/I30NoCSaZ2M?si=pA7R2ywBYqKtYpeS"}'
+xvfb-run -a npm run test:chrome
 ```
 
-## Docker One-Command Deploy
+Local fixture test for the full extension message chain:
 
 ```bash
-docker compose up -d --build
+npm run test:fixture
 ```
 
-Default backend is `yt-dlp`. Recommended environment variables:
+## Current Limitation
 
-```bash
-export RESOLVER_PROVIDER=yt-dlp
-export YTDLP_PROXY=http://your-proxy:port
-export YTDLP_COOKIES_FILE=/run/secrets/youtube-cookies.txt
-docker compose up -d --build
-```
+This branch is intentionally browser-side because server-side extraction on many VPS IPs now triggers YouTube bot checks.
 
-If you already have a working cobalt instance:
+The extension is materially better than a VPS resolver because it uses the user's own browsing session, but it still depends on whatever direct formats YouTube exposes in the active page context. When YouTube withholds progressive URLs, this branch will fail fast instead of pretending that a stable direct MP4 exists.
 
-```bash
-export RESOLVER_PROVIDER=cobalt
-export UPSTREAM_COBALT_BASE_URL=https://your-cobalt-api.example
-export UPSTREAM_COBALT_AUTH_HEADER='Authorization value if needed'
-docker compose up -d --build
-```
+In this environment, automated unpacked-extension loading was reliable with Playwright's bundled Chromium. The extension itself remains MV3 Chrome-compatible and can still be loaded manually in Google Chrome through `chrome://extensions`.
 
-## Tampermonkey Install
-
-Load [tampermonkey/youtube-download.user.js](/home/ribon/yt-shorts-resolver/tampermonkey/youtube-download.user.js) into Tampermonkey.
-
-If your backend is not running on `http://127.0.0.1:8787`, update `SERVER_BASE` near the top of the script.
-
-## Chrome Test
-
-UI injection test:
-
-```bash
-npm run e2e
-```
-
-This uses the `fixture` response path to verify the Chrome-side injection flow with the exact Shorts page URL, without claiming that YouTube extraction succeeded from this environment.
+For the provided test URL (`https://youtube.com/shorts/I30NoCSaZ2M?si=pA7R2ywBYqKtYpeS`), automated browser runs currently receive YouTube's `Sign in to confirm you’re not a bot` playability response. The extension now surfaces that state immediately instead of hanging on a resolver timeout.

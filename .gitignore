@@ -4,6 +4,4 @@ node_modules
 playwright-report
 test-results
 tmp
-cookies.txt
-cookies.json
-
+extension-test-profile
