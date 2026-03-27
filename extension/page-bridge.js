@@ -5,6 +5,8 @@
   const PAGE_SOURCE = "yt-shorts-resolver-page";
   const PLAYER_FETCH_TIMEOUT_MS = 8000;
   const PERFORMANCE_URL_MAX_AGE_MS = 45000;
+  const OBSERVED_URL_WAIT_MS = 3000;
+  const OBSERVED_URL_POLL_MS = 250;
   const NO_DOWNLOADABLE_MEDIA = "No downloadable media streams found";
   const MAX_SINGLE_STREAM_BYTES = 256 * 1024 * 1024;
   const MAX_TOTAL_INPUT_BYTES = 384 * 1024 * 1024;
@@ -22,6 +24,10 @@
 
   function isGoogleVideoPlaybackUrl(url) {
     return /^https:\/\/[^/]+\.googlevideo\.com\/videoplayback/i.test(url || "");
+  }
+
+  function delay(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
   function sanitizeFilenamePart(value) {
@@ -866,12 +872,12 @@
     };
   }
 
-  function payloadFromCandidates(candidates, title, strategy) {
+  async function payloadFromCandidates(candidates, title, strategy) {
     if (!Array.isArray(candidates) || candidates.length === 0) {
       return null;
     }
 
-    const observedPayload = observedPlaybackPayload(candidates, title, strategy);
+    const observedPayload = await observedPlaybackPayload(candidates, title, strategy);
     if (observedPayload) {
       return observedPayload;
     }
@@ -900,7 +906,7 @@
     }
 
     const candidates = await extractMediaCandidates(response, preferredPlayerJsUrl);
-    const payload = payloadFromCandidates(candidates, response?.videoDetails?.title || title, strategy);
+    const payload = await payloadFromCandidates(candidates, response?.videoDetails?.title || title, strategy);
     if (payload) {
       return payload;
     }
@@ -978,6 +984,69 @@
     return match?.url || "";
   }
 
+  async function waitForObservedPlaybackUrl(candidates) {
+    let directUrl = observedPlaybackUrl(candidates);
+    if (directUrl) {
+      return directUrl;
+    }
+
+    const video = currentVideoElement();
+    const moviePlayer = document.getElementById("movie_player");
+    if (!video && typeof moviePlayer?.playVideo !== "function") {
+      return "";
+    }
+
+    const wasPaused = Boolean(video?.paused);
+    try {
+      if (video?.paused) {
+        try {
+          const playAttempt = video.play();
+          if (playAttempt && typeof playAttempt.catch === "function") {
+            playAttempt.catch(() => undefined);
+          }
+        } catch {
+          // Ignore autoplay rejections.
+        }
+      }
+
+      if ((video?.paused ?? true) && typeof moviePlayer?.playVideo === "function") {
+        try {
+          moviePlayer.playVideo();
+        } catch {
+          // Ignore player API failures.
+        }
+      }
+
+      const deadline = Date.now() + OBSERVED_URL_WAIT_MS;
+      while (Date.now() < deadline) {
+        directUrl = observedPlaybackUrl(candidates);
+        if (directUrl) {
+          return directUrl;
+        }
+
+        await delay(OBSERVED_URL_POLL_MS);
+      }
+    } finally {
+      if (wasPaused) {
+        try {
+          video?.pause();
+        } catch {
+          // Ignore pause failures.
+        }
+
+        if (typeof moviePlayer?.pauseVideo === "function") {
+          try {
+            moviePlayer.pauseVideo();
+          } catch {
+            // Ignore player API failures.
+          }
+        }
+      }
+    }
+
+    return "";
+  }
+
   function currentSrcPayload(url, title) {
     const container = /mime=video%2Fwebm/i.test(url) ? "webm" : "mp4";
     return {
@@ -993,8 +1062,8 @@
     };
   }
 
-  function observedPlaybackPayload(candidates, title, strategy) {
-    const directUrl = observedPlaybackUrl(candidates);
+  async function observedPlaybackPayload(candidates, title, strategy) {
+    const directUrl = await waitForObservedPlaybackUrl(candidates);
     if (!directUrl) {
       return null;
     }
