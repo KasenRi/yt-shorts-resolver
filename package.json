@@ -1,6 +1,6 @@
 {
   "name": "yt-shorts-resolver",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Chrome extension for downloading YouTube videos and Shorts, including local audio/video merging for adaptive streams.",
   "type": "module",
   "main": "extension/background.js",
