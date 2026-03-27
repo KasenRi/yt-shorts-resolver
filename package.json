@@ -1,12 +1,15 @@
 {
   "name": "yt-shorts-resolver",
   "version": "1.0.0",
-  "description": "Single-tool Chrome extension for resolving and downloading YouTube videos and Shorts.",
+  "description": "Chrome extension for downloading YouTube videos and Shorts, including local audio/video merging for adaptive streams.",
   "type": "module",
   "main": "extension/background.js",
   "scripts": {
+    "prepare:assets": "node scripts/sync-ffmpeg-assets.mjs",
+    "postinstall": "npm run prepare:assets",
     "test:chrome": "node scripts/run-extension-test.mjs",
-    "test:fixture": "node scripts/run-fixture-test.mjs"
+    "test:fixture": "node scripts/run-fixture-test.mjs",
+    "test:merge": "node scripts/run-merge-test.mjs"
   },
   "keywords": [
     "chrome-extension",
@@ -17,6 +20,8 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@ffmpeg/core": "^0.12.10",
+    "@ffmpeg/ffmpeg": "^0.12.15",
     "playwright": "^1.58.2"
   }
 }

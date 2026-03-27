@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
   "name": "YT Shorts Resolver",
-  "description": "Inject a resolve/download button into YouTube and use the user's own browser session to derive direct media links.",
+  "description": "Inject a download button into YouTube, resolve available media streams, and merge separate audio/video tracks inside the extension when needed.",
   "version": "2.0.0",
   "permissions": [
     "downloads",
+    "offscreen",
     "tabs"
   ],
   "host_permissions": [
@@ -14,6 +15,9 @@
   "background": {
     "service_worker": "background.js",
     "type": "module"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
   },
   "content_scripts": [
     {
@@ -40,4 +44,3 @@
     }
   ]
 }
-

@@ -4,10 +4,20 @@
   const EXTENSION_SOURCE = "yt-shorts-resolver-content";
   const PAGE_SOURCE = "yt-shorts-resolver-page";
   const PLAYER_FETCH_TIMEOUT_MS = 8000;
-  const NO_PLAYABLE_FORMATS = "No playable direct format found";
+  const NO_DOWNLOADABLE_MEDIA = "No downloadable media streams found";
+  const MAX_SINGLE_STREAM_BYTES = 256 * 1024 * 1024;
+  const MAX_TOTAL_INPUT_BYTES = 384 * 1024 * 1024;
+  const WEBM_VIDEO_CODEC_FAMILIES = new Set(["vp8", "vp9", "av1"]);
+  const WEBM_AUDIO_CODEC_FAMILIES = new Set(["opus", "vorbis"]);
+  const MP4_VIDEO_CODEC_FAMILIES = new Set(["h264", "hevc", "av1", "mpeg4"]);
+  const MP4_AUDIO_CODEC_FAMILIES = new Set(["aac", "mp3"]);
   const playerJsTextCache = new Map();
   const signaturePlanCache = new Map();
   let inlinePlayerResponseCache;
+
+  function isDownloadableUrl(url) {
+    return /^https?:/i.test(url || "") || /^data:/i.test(url || "");
+  }
 
   function sanitizeFilenamePart(value) {
     return String(value || "youtube-video")
@@ -20,6 +30,75 @@
     const safeTitle = sanitizeFilenamePart(title) || "youtube-video";
     const safeExt = ext || "mp4";
     return `${safeTitle}.${safeExt}`;
+  }
+
+  function normalizeContentLength(value) {
+    const numeric = Number(value || 0);
+    return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+  }
+
+  function codecTokensFromMimeType(mimeType) {
+    const match = String(mimeType || "").match(/codecs\s*=\s*"?([^";]+)"?/i);
+    if (!match?.[1]) {
+      return [];
+    }
+
+    return match[1]
+      .split(",")
+      .map((token) => token.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  function detectVideoCodecFamily(mimeType) {
+    for (const token of codecTokensFromMimeType(mimeType)) {
+      if (/^(avc1|avc3|h264)/.test(token)) {
+        return "h264";
+      }
+
+      if (/^(hev1|hvc1|hevc)/.test(token)) {
+        return "hevc";
+      }
+
+      if (/^(av01|av1)/.test(token)) {
+        return "av1";
+      }
+
+      if (/^(vp09|vp9)/.test(token)) {
+        return "vp9";
+      }
+
+      if (/^(vp08|vp8)/.test(token)) {
+        return "vp8";
+      }
+
+      if (/^mp4v/.test(token)) {
+        return "mpeg4";
+      }
+    }
+
+    return "";
+  }
+
+  function detectAudioCodecFamily(mimeType) {
+    for (const token of codecTokensFromMimeType(mimeType)) {
+      if (/^(mp4a|aac)/.test(token)) {
+        return "aac";
+      }
+
+      if (/^opus/.test(token)) {
+        return "opus";
+      }
+
+      if (/vorbis/.test(token)) {
+        return "vorbis";
+      }
+
+      if (/^(mp3|mpga)/.test(token)) {
+        return "mp3";
+      }
+    }
+
+    return "";
   }
 
   function escapeRegex(value) {
@@ -175,7 +254,7 @@
           return resolved;
         }
       } catch {
-        // Ignore missing config.
+        // Ignore missing player config.
       }
     }
 
@@ -204,6 +283,7 @@
 
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
     try {
       const response = await fetch(url, {
         credentials: "include",
@@ -219,6 +299,7 @@
       if (error?.name === "AbortError") {
         throw new Error(`Timed out while requesting ${url}`);
       }
+
       throw error;
     } finally {
       window.clearTimeout(timeoutId);
@@ -257,7 +338,6 @@
         return {
           args: match[1],
           body,
-          source: text.slice(match.index, bodyStart + body.length),
         };
       }
     }
@@ -383,6 +463,7 @@
         if (!operation) {
           return null;
         }
+
         operations.push({
           type: operation,
           argument: Number(helperMatch[3] || 0),
@@ -405,7 +486,6 @@
       const sliceMatch = statement.match(/^a=a\.slice\((\d+)\)$/);
       if (sliceMatch) {
         operations.push({ type: "slice", argument: Number(sliceMatch[1]) });
-        continue;
       }
     }
 
@@ -420,12 +500,7 @@
         continue;
       }
 
-      if (operation.type === "splice") {
-        chars.splice(0, operation.argument);
-        continue;
-      }
-
-      if (operation.type === "slice") {
+      if (operation.type === "splice" || operation.type === "slice") {
         chars.splice(0, operation.argument);
         continue;
       }
@@ -495,27 +570,115 @@
     return url.toString();
   }
 
+  function containerForMimeType(mimeType) {
+    return /webm/i.test(mimeType || "") ? "webm" : "mp4";
+  }
+
+  function extensionForStream({ container, hasVideo }) {
+    if (container === "webm") {
+      return "webm";
+    }
+
+    return hasVideo ? "mp4" : "m4a";
+  }
+
+  function preferredOutputExtForVideo(candidate) {
+    const codecFamily = detectVideoCodecFamily(candidate?.mimeType);
+    if (WEBM_VIDEO_CODEC_FAMILIES.has(codecFamily) && !MP4_VIDEO_CODEC_FAMILIES.has(codecFamily)) {
+      return "webm";
+    }
+
+    if (MP4_VIDEO_CODEC_FAMILIES.has(codecFamily) && !WEBM_VIDEO_CODEC_FAMILIES.has(codecFamily)) {
+      return "mp4";
+    }
+
+    return candidate?.container === "webm" ? "webm" : "mp4";
+  }
+
+  function isVideoCompatibleWithOutput(candidate, outputExt) {
+    const codecFamily = detectVideoCodecFamily(candidate?.mimeType);
+    if (!codecFamily) {
+      return candidate?.container === outputExt;
+    }
+
+    return outputExt === "webm"
+      ? WEBM_VIDEO_CODEC_FAMILIES.has(codecFamily)
+      : MP4_VIDEO_CODEC_FAMILIES.has(codecFamily);
+  }
+
+  function isAudioCompatibleWithOutput(candidate, outputExt) {
+    const codecFamily = detectAudioCodecFamily(candidate?.mimeType);
+    if (!codecFamily) {
+      return candidate?.container === outputExt;
+    }
+
+    return outputExt === "webm"
+      ? WEBM_AUDIO_CODEC_FAMILIES.has(codecFamily)
+      : MP4_AUDIO_CODEC_FAMILIES.has(codecFamily);
+  }
+
+  function buildMergePlan(video, audio) {
+    let outputExt = preferredOutputExtForVideo(video);
+    if (!isVideoCompatibleWithOutput(video, outputExt)) {
+      outputExt = video?.container === "webm" ? "webm" : "mp4";
+    }
+
+    const requiresTranscode = !isAudioCompatibleWithOutput(audio, outputExt);
+    return {
+      outputExt,
+      requiresTranscode,
+    };
+  }
+
+  function streamWithinBudget(candidate) {
+    return candidate.contentLength === 0 || candidate.contentLength <= MAX_SINGLE_STREAM_BYTES;
+  }
+
+  function pairWithinBudget(video, audio) {
+    if (!streamWithinBudget(video) || !streamWithinBudget(audio)) {
+      return false;
+    }
+
+    if (video.contentLength > 0 && audio.contentLength > 0) {
+      return video.contentLength + audio.contentLength <= MAX_TOTAL_INPUT_BYTES;
+    }
+
+    return true;
+  }
+
   function describeCandidate(format, directUrl) {
     const mimeType = format?.mimeType || "";
     const hasAudio = Boolean(format?.audioQuality || (format?.audioTrack && format.audioTrack.id) || /audio\//.test(mimeType));
     const hasVideo = Boolean(format?.qualityLabel || format?.width || format?.height || /video\//.test(mimeType));
+    const container = containerForMimeType(mimeType);
+
     return {
       directUrl,
-      ext: mimeType.includes("webm") ? "webm" : "mp4",
       mimeType,
+      container,
+      ext: extensionForStream({ container, hasVideo }),
       height: Number(format?.height || 0),
       bitrate: Number(format?.bitrate || 0),
       qualityLabel: format?.qualityLabel || "",
       hasAudio,
       hasVideo,
+      contentLength: normalizeContentLength(format?.contentLength),
     };
   }
 
-  function compareCandidates(left, right) {
-    const leftTier = left.hasAudio && left.hasVideo ? 3 : left.hasVideo ? 2 : left.hasAudio ? 1 : 0;
-    const rightTier = right.hasAudio && right.hasVideo ? 3 : right.hasVideo ? 2 : right.hasAudio ? 1 : 0;
-    if (rightTier !== leftTier) {
-      return rightTier - leftTier;
+  function compareContainer(left, right) {
+    const preference = {
+      mp4: 2,
+      webm: 1,
+    };
+
+    return (preference[right.container] || 0) - (preference[left.container] || 0);
+  }
+
+  function compareProgressive(left, right) {
+    const containerOrder = compareContainer(left, right);
+    if (containerOrder !== 0) {
+      return containerOrder;
     }
 
     if (right.height !== left.height) {
@@ -523,6 +686,68 @@
     }
 
     return right.bitrate - left.bitrate;
+  }
+
+  function compareVideoOnly(left, right) {
+    const containerOrder = compareContainer(left, right);
+    if (containerOrder !== 0) {
+      return containerOrder;
+    }
+
+    if (right.height !== left.height) {
+      return right.height - left.height;
+    }
+
+    return right.bitrate - left.bitrate;
+  }
+
+  function compareAudioOnly(left, right) {
+    const containerOrder = compareContainer(left, right);
+    if (containerOrder !== 0) {
+      return containerOrder;
+    }
+
+    return right.bitrate - left.bitrate;
+  }
+
+  function compareMergeCandidates(left, right) {
+    if (right.video.height !== left.video.height) {
+      return right.video.height - left.video.height;
+    }
+
+    if (left.plan.requiresTranscode !== right.plan.requiresTranscode) {
+      return Number(left.plan.requiresTranscode) - Number(right.plan.requiresTranscode);
+    }
+
+    if (right.video.bitrate !== left.video.bitrate) {
+      return right.video.bitrate - left.video.bitrate;
+    }
+
+    if (right.audio.bitrate !== left.audio.bitrate) {
+      return right.audio.bitrate - left.audio.bitrate;
+    }
+
+    return compareContainer(left.video, right.video);
+  }
+
+  function preferMergePair(progressive, pair) {
+    if (!pair) {
+      return false;
+    }
+
+    if (!progressive) {
+      return true;
+    }
+
+    if (pair.video.height && pair.video.height > progressive.height) {
+      return true;
+    }
+
+    if (!pair.video.height && pair.video.bitrate > progressive.bitrate) {
+      return true;
+    }
+
+    return false;
   }
 
   async function extractMediaCandidates(response, preferredPlayerJsUrl) {
@@ -534,56 +759,168 @@
     const candidates = [];
     for (const format of formats) {
       const directUrl = format.url || await resolveCipherUrl(format, preferredPlayerJsUrl);
-      if (!directUrl) {
+      if (!directUrl || !isDownloadableUrl(directUrl)) {
         continue;
       }
 
       candidates.push(describeCandidate(format, directUrl));
     }
 
-    return candidates.sort(compareCandidates);
+    return candidates;
   }
 
-  async function waitForCurrentSrc() {
-    const video = currentVideoElement();
-    if (!video) {
-      return "";
-    }
+  function serializeStream(candidate) {
+    return {
+      url: candidate.directUrl,
+      ext: candidate.ext,
+      mimeType: candidate.mimeType,
+      container: candidate.container,
+      qualityLabel: candidate.qualityLabel,
+      contentLength: candidate.contentLength,
+    };
+  }
 
-    if (video.currentSrc) {
-      return video.currentSrc;
-    }
+  function pickBestProgressive(candidates) {
+    return candidates
+      .filter((candidate) => candidate.hasAudio && candidate.hasVideo)
+      .sort(compareProgressive)[0] || null;
+  }
 
-    try {
-      const playResult = video.play();
-      if (playResult && typeof playResult.then === "function") {
-        await Promise.race([
-          playResult.catch(() => undefined),
-          new Promise((resolve) => window.setTimeout(resolve, 1200)),
-        ]);
+  function pickBestMergePair(candidates) {
+    const videoOnly = candidates
+      .filter((candidate) => candidate.hasVideo && !candidate.hasAudio)
+      .sort(compareVideoOnly);
+    const audioOnly = candidates
+      .filter((candidate) => candidate.hasAudio && !candidate.hasVideo)
+      .sort(compareAudioOnly);
+
+    const pairs = [];
+    for (const video of videoOnly) {
+      for (const audio of audioOnly) {
+        if (!pairWithinBudget(video, audio)) {
+          continue;
+        }
+
+        pairs.push({
+          video,
+          audio,
+          plan: buildMergePlan(video, audio),
+        });
       }
-    } catch {
-      // Ignore autoplay restrictions.
     }
 
-    if (video.currentSrc) {
-      return video.currentSrc;
+    pairs.sort(compareMergeCandidates);
+    if (pairs.length === 0) {
+      return null;
     }
 
-    await new Promise((resolve) => {
-      const onLoaded = () => {
-        video.removeEventListener("loadedmetadata", onLoaded);
-        resolve();
-      };
+    return {
+      video: pairs[0].video,
+      audio: pairs[0].audio,
+      outputExt: pairs[0].plan.outputExt,
+      requiresTranscode: pairs[0].plan.requiresTranscode,
+    };
+  }
 
-      video.addEventListener("loadedmetadata", onLoaded, { once: true });
-      window.setTimeout(() => {
-        video.removeEventListener("loadedmetadata", onLoaded);
-        resolve();
-      }, 2500);
-    });
+  function hasOnlyOverBudgetMergePairs(candidates) {
+    const videoOnly = candidates.filter((candidate) => candidate.hasVideo && !candidate.hasAudio);
+    const audioOnly = candidates.filter((candidate) => candidate.hasAudio && !candidate.hasVideo);
+    if (videoOnly.length === 0 || audioOnly.length === 0) {
+      return false;
+    }
 
-    return video.currentSrc || "";
+    return videoOnly.every((video) => audioOnly.every((audio) => !pairWithinBudget(video, audio)));
+  }
+
+  function directPayload(candidate, title, strategy) {
+    const outputExt = candidate.container === "webm" ? "webm" : "mp4";
+    return {
+      mode: "direct",
+      title,
+      filename: buildFilename(title, outputExt),
+      directUrl: candidate.directUrl,
+      strategy,
+      hasAudio: candidate.hasAudio,
+      hasVideo: candidate.hasVideo,
+      qualityLabel: candidate.qualityLabel,
+      container: candidate.container,
+    };
+  }
+
+  function mergePayload(pair, title, strategy) {
+    return {
+      mode: "merge",
+      title,
+      filename: buildFilename(title, pair.outputExt),
+      outputExt: pair.outputExt,
+      requiresTranscode: Boolean(pair.requiresTranscode),
+      strategy,
+      qualityLabel: pair.video.qualityLabel,
+      video: serializeStream(pair.video),
+      audio: serializeStream(pair.audio),
+    };
+  }
+
+  function payloadFromCandidates(candidates, title, strategy) {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return null;
+    }
+
+    const progressive = pickBestProgressive(candidates);
+    const mergePair = pickBestMergePair(candidates);
+
+    if (preferMergePair(progressive, mergePair)) {
+      return mergePayload(mergePair, title, strategy);
+    }
+
+    if (progressive) {
+      return directPayload(progressive, title, strategy);
+    }
+
+    if (mergePair) {
+      return mergePayload(mergePair, title, strategy);
+    }
+
+    return null;
+  }
+
+  async function resolveFromResponse(response, title, strategy, preferredPlayerJsUrl) {
+    if (!response) {
+      return null;
+    }
+
+    const candidates = await extractMediaCandidates(response, preferredPlayerJsUrl);
+    const payload = payloadFromCandidates(candidates, response?.videoDetails?.title || title, strategy);
+    if (payload) {
+      return payload;
+    }
+
+    if (hasOnlyOverBudgetMergePairs(candidates)) {
+      throw new Error("当前仅有分离音视频流，但都超出浏览器内合并上限");
+    }
+
+    return null;
+  }
+
+  function currentDirectVideoSrc() {
+    const video = currentVideoElement();
+    const currentSrc = video?.currentSrc || "";
+    return /^https?:/i.test(currentSrc) ? currentSrc : "";
+  }
+
+  function currentSrcPayload(url, title) {
+    const container = /mime=video%2Fwebm/i.test(url) ? "webm" : "mp4";
+    return {
+      mode: "direct",
+      title,
+      filename: buildFilename(title, container === "webm" ? "webm" : "mp4"),
+      directUrl: url,
+      strategy: "video-current-src",
+      hasAudio: true,
+      hasVideo: true,
+      qualityLabel: "",
+      container,
+    };
   }
 
   async function fetchPlayerResponse(videoId) {
@@ -597,6 +934,7 @@
 
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), PLAYER_FETCH_TIMEOUT_MS);
+
     let response;
     try {
       response = await fetch(`/youtubei/v1/player?key=${apiKey}&prettyPrint=false`, {
@@ -617,15 +955,16 @@
           racyCheckOk: true,
           playbackContext: {
             contentPlaybackContext: {
-              html5Preference: "HTML5_PREF_WANTS"
-            }
-          }
+              html5Preference: "HTML5_PREF_WANTS",
+            },
+          },
         }),
       });
     } catch (error) {
       if (error?.name === "AbortError") {
         throw new Error("Timed out while requesting youtubei player data");
       }
+
       throw error;
     } finally {
       window.clearTimeout(timeoutId);
@@ -648,31 +987,20 @@
       response: extractJsonAssignmentFromText(html, "var ytInitialPlayerResponse = "),
       playerJsUrl: resolvePlayerJsUrl(
         html.match(/"jsUrl":"([^"]+base\.js)"/)?.[1] ||
-        html.match(/"PLAYER_JS_URL":"([^"]+base\.js)"/)?.[1]
+        html.match(/"PLAYER_JS_URL":"([^"]+base\.js)"/)?.[1],
       ),
     };
   }
 
-  async function resolveFromResponse(response, title, strategy, preferredPlayerJsUrl) {
-    if (!response) {
-      return null;
+  function rememberError(errors, error) {
+    if (error instanceof Error && error.message) {
+      errors.push(error.message);
+      return;
     }
 
-    const candidates = await extractMediaCandidates(response, preferredPlayerJsUrl);
-    if (candidates.length === 0) {
-      return null;
+    if (typeof error === "string" && error) {
+      errors.push(error);
     }
-
-    const best = candidates[0];
-    return {
-      title: response?.videoDetails?.title || title,
-      filename: buildFilename(response?.videoDetails?.title || title, best.ext),
-      directUrl: best.directUrl,
-      strategy,
-      hasAudio: best.hasAudio,
-      hasVideo: best.hasVideo,
-      qualityLabel: best.qualityLabel,
-    };
   }
 
   async function resolveDownload() {
@@ -680,50 +1008,59 @@
     const videoData = playerVideoData();
     const title = response?.videoDetails?.title || videoData?.title || document.title.replace(/\s*-\s*YouTube$/, "") || "YouTube Video";
     const jsUrl = playerJsUrl();
+    const errors = [];
 
-    const fromPlayer = await resolveFromResponse(response, title, "player-response", jsUrl);
-    if (fromPlayer) {
-      return fromPlayer;
-    }
-
-    const currentSrc = await waitForCurrentSrc();
-    if (currentSrc) {
-      return {
-        title,
-        filename: buildFilename(title, "mp4"),
-        directUrl: currentSrc,
-        strategy: "video-current-src",
-        hasAudio: true,
-        hasVideo: true,
-        qualityLabel: "",
-      };
+    try {
+      const fromPlayer = await resolveFromResponse(response, title, "player-response", jsUrl);
+      if (fromPlayer) {
+        return fromPlayer;
+      }
+    } catch (error) {
+      rememberError(errors, error);
     }
 
     const videoId = currentVideoId();
-    const fromWatchPage = await fetchWatchPageData(videoId);
-    const watchResult = await resolveFromResponse(
-      fromWatchPage?.response,
-      title,
-      "watch-page-html",
-      fromWatchPage?.playerJsUrl || jsUrl
-    );
-    if (watchResult) {
-      return watchResult;
+    let watchPageData = null;
+    try {
+      watchPageData = await fetchWatchPageData(videoId);
+      const fromWatchPage = await resolveFromResponse(
+        watchPageData?.response,
+        title,
+        "watch-page-html",
+        watchPageData?.playerJsUrl || jsUrl,
+      );
+      if (fromWatchPage) {
+        return fromWatchPage;
+      }
+    } catch (error) {
+      rememberError(errors, error);
     }
 
-    const fetchedResponse = await fetchPlayerResponse(videoId);
-    const fromYoutubei = await resolveFromResponse(fetchedResponse, title, "youtubei-player", jsUrl);
-    if (fromYoutubei) {
-      return fromYoutubei;
+    let fetchedResponse = null;
+    try {
+      fetchedResponse = await fetchPlayerResponse(videoId);
+      const fromYoutubei = await resolveFromResponse(fetchedResponse, title, "youtubei-player", jsUrl);
+      if (fromYoutubei) {
+        return fromYoutubei;
+      }
+    } catch (error) {
+      rememberError(errors, error);
+    }
+
+    const currentSrc = currentDirectVideoSrc();
+    if (currentSrc) {
+      return currentSrcPayload(currentSrc, title);
     }
 
     const playability = (
       fetchedResponse?.playabilityStatus?.reason ||
-      fromWatchPage?.response?.playabilityStatus?.reason ||
+      watchPageData?.response?.playabilityStatus?.reason ||
       response?.playabilityStatus?.reason ||
       inlinePlayerResponse()?.playabilityStatus?.reason ||
-      NO_PLAYABLE_FORMATS
+      errors[0] ||
+      NO_DOWNLOADABLE_MEDIA
     );
+
     throw new Error(playability);
   }
 
@@ -742,7 +1079,7 @@
           ok: true,
           payload,
         },
-        "*"
+        "*",
       );
     } catch (error) {
       window.postMessage(
@@ -752,7 +1089,7 @@
           ok: false,
           error: error instanceof Error ? error.message : "Unknown resolve error",
         },
-        "*"
+        "*",
       );
     }
   });

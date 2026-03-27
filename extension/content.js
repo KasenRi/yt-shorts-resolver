@@ -3,7 +3,10 @@ const PAGE_SOURCE = "yt-shorts-resolver-page";
 const BUTTON_CLASS = "ytr-resolve-download-button";
 const BRIDGE_ID = "ytr-page-bridge";
 const REQUEST_TIMEOUT_MS = 15000;
-const NO_PLAYABLE_FORMATS = "No playable direct format found";
+const BUTTON_RESET_DELAY_MS = 2200;
+
+let runtimeListenerRegistered = false;
+let injectScheduled = false;
 
 function isYouTubeVideoPage() {
   return location.pathname.startsWith("/shorts/") || location.pathname === "/watch";
@@ -35,228 +38,6 @@ function injectBridge() {
   (document.head || document.documentElement).appendChild(script);
 }
 
-function sanitizeFilenamePart(value) {
-  return String(value || "youtube-video")
-    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function buildFilename(title, ext) {
-  const safeTitle = sanitizeFilenamePart(title) || "youtube-video";
-  return `${safeTitle}.${ext || "mp4"}`;
-}
-
-function simplifyCipherUrl(format) {
-  if (!format?.signatureCipher) {
-    return "";
-  }
-
-  const params = new URLSearchParams(format.signatureCipher);
-  const base = params.get("url");
-  if (!base) {
-    return "";
-  }
-
-  const sp = params.get("sp");
-  const sig = params.get("sig") || params.get("lsig");
-  if (!sp || !sig) {
-    return base;
-  }
-
-  const url = new URL(base);
-  url.searchParams.set(sp, sig);
-  return url.toString();
-}
-
-function scoreFormat(format) {
-  const hasAudio = Boolean(format?.audioQuality || (format?.audioTrack && format?.audioTrack.id) || (format?.mimeType || "").includes("audio/mp4"));
-  const hasVideo = Boolean((format?.mimeType || "").includes("video/") || format?.width || format?.height || format?.qualityLabel);
-  const height = Number(format?.height || 0);
-  if (hasAudio && hasVideo) {
-    return 10000 + height;
-  }
-  if (hasVideo) {
-    return 5000 + height;
-  }
-  if (hasAudio) {
-    return 1000;
-  }
-  return 0;
-}
-
-function extractDirectFormats(response) {
-  const formats = [
-    ...(Array.isArray(response?.streamingData?.formats) ? response.streamingData.formats : []),
-    ...(Array.isArray(response?.streamingData?.adaptiveFormats) ? response.streamingData.adaptiveFormats : []),
-  ];
-  return formats
-    .map((format) => {
-      const directUrl = format.url || simplifyCipherUrl(format);
-      return {
-        directUrl,
-        ext: format.mimeType?.includes("webm") ? "webm" : "mp4",
-        qualityLabel: format.qualityLabel || "",
-        mimeType: format.mimeType || "",
-        hasAudio: /audio\//.test(format.mimeType || "") || Boolean(format.audioQuality),
-        hasVideo: /video\//.test(format.mimeType || "") || Boolean(format.qualityLabel),
-        height: Number(format.height || 0),
-      };
-    })
-    .filter((format) => format.directUrl);
-}
-
-function extractInlineJsonAssignment(marker) {
-  const scripts = Array.from(document.scripts || []);
-  for (const script of scripts) {
-    const text = script.textContent || "";
-    const start = text.indexOf(marker);
-    if (start === -1) {
-      continue;
-    }
-
-    const from = start + marker.length;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    let end = -1;
-
-    for (let index = from; index < text.length; index += 1) {
-      const char = text[index];
-      if (escaped) {
-        escaped = false;
-        continue;
-      }
-
-      if (char === "\\") {
-        escaped = true;
-        continue;
-      }
-
-      if (char === "\"") {
-        inString = !inString;
-        continue;
-      }
-
-      if (inString) {
-        continue;
-      }
-
-      if (char === "{") {
-        depth += 1;
-      } else if (char === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          end = index + 1;
-          break;
-        }
-      }
-    }
-
-    const candidate = (end === -1 ? text.slice(from) : text.slice(from, end)).trim();
-    if (!candidate) {
-      continue;
-    }
-
-    try {
-      return JSON.parse(candidate);
-    } catch {
-      continue;
-    }
-  }
-
-  return null;
-}
-
-function currentVideoElement() {
-  return (
-    document.querySelector("ytd-reel-video-renderer[is-active] video") ||
-    document.querySelector("#movie_player video") ||
-    document.querySelector("video")
-  );
-}
-
-async function waitForCurrentSrc() {
-  const video = currentVideoElement();
-  if (!video) {
-    return "";
-  }
-
-  if (video.currentSrc) {
-    return video.currentSrc;
-  }
-
-  try {
-    const playResult = video.play();
-    if (playResult && typeof playResult.then === "function") {
-      await Promise.race([
-        playResult.catch(() => undefined),
-        new Promise((resolve) => window.setTimeout(resolve, 1200)),
-      ]);
-    }
-  } catch {
-    // Ignore autoplay restrictions.
-  }
-
-  if (video.currentSrc) {
-    return video.currentSrc;
-  }
-
-  await new Promise((resolve) => {
-    const onLoaded = () => {
-      video.removeEventListener("loadedmetadata", onLoaded);
-      resolve();
-    };
-
-    video.addEventListener("loadedmetadata", onLoaded, { once: true });
-    window.setTimeout(() => {
-      video.removeEventListener("loadedmetadata", onLoaded);
-      resolve();
-    }, 2500);
-  });
-
-  return video.currentSrc || "";
-}
-
-async function resolveFromInlineState() {
-  const response = extractInlineJsonAssignment("var ytInitialPlayerResponse = ");
-  const title = response?.videoDetails?.title || document.title.replace(/\s*-\s*YouTube$/, "") || "YouTube Video";
-  const formats = extractDirectFormats(response).sort((left, right) => scoreFormat(right) - scoreFormat(left));
-  if (formats.length > 0) {
-    const best = formats[0];
-    return {
-      title,
-      filename: buildFilename(title, best.ext),
-      directUrl: best.directUrl,
-      strategy: "inline-player-response",
-    };
-  }
-
-  const currentSrc = await waitForCurrentSrc();
-  if (currentSrc) {
-    return {
-      title,
-      filename: buildFilename(title, "mp4"),
-      directUrl: currentSrc,
-      strategy: "video-current-src",
-    };
-  }
-
-  throw new Error(response?.playabilityStatus?.reason || NO_PLAYABLE_FORMATS);
-}
-
-function findActionBar() {
-  const candidates = [
-    ...document.querySelectorAll("ytd-reel-player-overlay-renderer #actions"),
-    ...document.querySelectorAll("ytd-menu-renderer #top-level-buttons-computed"),
-    ...document.querySelectorAll("#actions-inner"),
-  ];
-
-  const visible = candidates.find(isVisibleElement);
-
-  return visible || candidates[0] || null;
-}
-
 function isVisibleElement(element) {
   if (!element) {
     return false;
@@ -267,9 +48,44 @@ function isVisibleElement(element) {
   return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
 }
 
+function findActionBar() {
+  const candidates = [
+    ...document.querySelectorAll("ytd-reel-player-overlay-renderer #actions"),
+    ...document.querySelectorAll("ytd-menu-renderer #top-level-buttons-computed"),
+    ...document.querySelectorAll("#actions-inner"),
+  ];
+
+  const visible = candidates.find(isVisibleElement);
+  return visible || candidates[0] || null;
+}
+
+function currentButton() {
+  return document.querySelector(`.${BUTTON_CLASS}`);
+}
+
+function removeCurrentButton() {
+  currentButton()?.remove();
+}
+
 function setButtonState(button, state, text) {
   button.dataset.state = state || "";
+  button.disabled = state === "busy";
   button.textContent = text;
+}
+
+function scheduleButtonReset(button, originalText) {
+  const previousTimer = Number(button.dataset.resetTimerId || 0);
+  if (previousTimer) {
+    window.clearTimeout(previousTimer);
+  }
+
+  const timeoutId = window.setTimeout(() => {
+    button.title = "";
+    setButtonState(button, "", originalText);
+    delete button.dataset.resetTimerId;
+  }, BUTTON_RESET_DELAY_MS);
+
+  button.dataset.resetTimerId = String(timeoutId);
 }
 
 function waitForResolve(requestId) {
@@ -290,6 +106,7 @@ function waitForResolve(requestId) {
         resolve(event.data.payload);
         return;
       }
+
       reject(new Error(event.data?.error || "Unknown page resolver error"));
     }
 
@@ -298,8 +115,11 @@ function waitForResolve(requestId) {
 }
 
 async function resolveFromPage() {
+  injectBridge();
+
   const requestId = crypto.randomUUID();
   const resultPromise = waitForResolve(requestId);
+
   window.postMessage(
     {
       source: EXTENSION_SOURCE,
@@ -309,67 +129,122 @@ async function resolveFromPage() {
         url: getCanonicalVideoUrl(),
       },
     },
-    "*"
+    "*",
   );
+
   return resultPromise;
 }
 
-async function resolveDownloadPayload() {
-  try {
-    return await resolveFromInlineState();
-  } catch (inlineError) {
-    if (inlineError instanceof Error && inlineError.message && inlineError.message !== NO_PLAYABLE_FORMATS) {
-      throw inlineError;
-    }
+function handleDownloadStatus(message) {
+  if (message?.type !== "download-status") {
+    return;
   }
 
-  try {
-    return await resolveFromPage();
-  } catch (pageError) {
-    try {
-      return await resolveFromInlineState();
-    } catch (inlineError) {
-      if (inlineError instanceof Error && inlineError.message && inlineError.message !== NO_PLAYABLE_FORMATS) {
-        throw inlineError;
-      }
-      throw pageError;
-    }
+  const button = currentButton();
+  if (!button || !message.jobId || button.dataset.jobId !== message.jobId) {
+    return;
+  }
+
+  const originalText = button.dataset.originalText || "解析下载";
+
+  if (message.phase === "running") {
+    button.title = Number.isFinite(message.percent) ? `${Math.round(message.percent * 100)}%` : "";
+    setButtonState(button, "busy", message.text || "处理中...");
+    return;
+  }
+
+  button.dataset.jobId = "";
+
+  if (message.phase === "complete") {
+    button.title = "";
+    setButtonState(button, "", message.text || "已保存");
+    scheduleButtonReset(button, originalText);
+    return;
+  }
+
+  if (message.phase === "error") {
+    button.title = message.error || "";
+    setButtonState(button, "error", message.text || "下载失败");
+    scheduleButtonReset(button, originalText);
   }
 }
 
+function ensureRuntimeListener() {
+  if (runtimeListenerRegistered || !chrome.runtime?.onMessage?.addListener) {
+    return;
+  }
+
+  chrome.runtime.onMessage.addListener((message) => {
+    handleDownloadStatus(message);
+    return undefined;
+  });
+
+  runtimeListenerRegistered = true;
+}
+
 async function triggerDownload(button) {
-  const originalText = button.textContent;
-  setButtonState(button, "busy", "解析中...");
+  if (button.dataset.state === "busy") {
+    return;
+  }
+
+  const originalText = button.dataset.originalText || button.textContent || "解析下载";
+  button.dataset.originalText = originalText;
+
+  const previousTimer = Number(button.dataset.resetTimerId || 0);
+  if (previousTimer) {
+    window.clearTimeout(previousTimer);
+    delete button.dataset.resetTimerId;
+  }
+
   button.title = "";
+  setButtonState(button, "busy", "解析中...");
 
   try {
-    const payload = await resolveDownloadPayload();
-    await chrome.runtime.sendMessage({
-      type: "download",
+    const request = await resolveFromPage();
+    const jobId = crypto.randomUUID();
+    button.dataset.jobId = jobId;
+
+    const response = await chrome.runtime.sendMessage({
+      type: "start-download",
       payload: {
-        url: payload.directUrl,
-        filename: payload.filename,
-        openInNewTab: false,
+        jobId,
+        request,
       },
     });
-    setButtonState(button, "", "已开始下载");
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Unable to start download");
+    }
+
+    if (response.tracking || response.mode === "merge") {
+      setButtonState(
+        button,
+        "busy",
+        response.text || (response.mode === "merge" ? "准备合并..." : "开始下载..."),
+      );
+      return;
+    }
+
+    button.dataset.jobId = "";
+    button.title = response.error || "";
+    setButtonState(button, "", response.mode === "tab-fallback" ? "已在新标签打开" : "已开始下载");
+    scheduleButtonReset(button, originalText);
   } catch (error) {
+    button.dataset.jobId = "";
     console.error("[yt-shorts-resolver]", error);
-    button.title = error instanceof Error ? error.message : "Unknown resolver error";
-    setButtonState(button, "error", "解析失败");
-  } finally {
-    window.setTimeout(() => {
-      button.title = "";
-      setButtonState(button, "", originalText);
-    }, 2200);
+    button.title = error instanceof Error ? error.message : "Unknown download error";
+    setButtonState(button, "error", "下载失败");
+    scheduleButtonReset(button, originalText);
   }
 }
 
 function injectButton() {
   if (!isYouTubeVideoPage()) {
+    removeCurrentButton();
     return;
   }
 
+  ensureRuntimeListener();
   injectBridge();
 
   const actionBar = findActionBar();
@@ -377,7 +252,7 @@ function injectButton() {
     return;
   }
 
-  const existingButton = document.querySelector(`.${BUTTON_CLASS}`);
+  const existingButton = currentButton();
   if (existingButton) {
     if (existingButton.parentElement !== actionBar && isVisibleElement(actionBar)) {
       actionBar.appendChild(existingButton);
@@ -388,11 +263,26 @@ function injectButton() {
   const button = document.createElement("button");
   button.type = "button";
   button.className = BUTTON_CLASS;
+  button.dataset.originalText = "解析下载";
+  button.dataset.jobId = "";
   button.textContent = "解析下载";
   button.addEventListener("click", () => {
     void triggerDownload(button);
   });
+
   actionBar.appendChild(button);
+}
+
+function scheduleInjectButton() {
+  if (injectScheduled) {
+    return;
+  }
+
+  injectScheduled = true;
+  window.requestAnimationFrame(() => {
+    injectScheduled = false;
+    injectButton();
+  });
 }
 
 function init() {
@@ -401,10 +291,10 @@ function init() {
     return;
   }
 
-  injectButton();
+  scheduleInjectButton();
 
   const observer = new MutationObserver(() => {
-    injectButton();
+    scheduleInjectButton();
   });
 
   observer.observe(document.documentElement, {
@@ -412,7 +302,7 @@ function init() {
     childList: true,
   });
 
-  window.addEventListener("yt-navigate-finish", injectButton);
+  window.addEventListener("yt-navigate-finish", scheduleInjectButton);
 }
 
 init();
