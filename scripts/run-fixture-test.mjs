@@ -215,6 +215,53 @@ function watchFallbackFixture() {
   `);
 }
 
+function performanceObservedFixture(origin) {
+  const response = {
+    videoDetails: {
+      title: "Performance Observed Fixture",
+    },
+    streamingData: {
+      formats: [
+        {
+          qualityLabel: "720p",
+          height: 720,
+          mimeType: 'video/mp4; codecs="avc1.64001F, mp4a.40.2"',
+          url: `${origin}/media/performance-raw.mp4?id=fixture-observed-id&n=raw-token`,
+          audioQuality: "AUDIO_QUALITY_MEDIUM",
+        },
+      ],
+    },
+  };
+
+  return fixtureHtml(`
+    <script>
+      window.ytInitialPlayerResponse = ${JSON.stringify(response)};
+
+      const moviePlayer = document.getElementById("movie_player");
+      moviePlayer.getPlayerResponse = () => null;
+      moviePlayer.getVideoData = () => ({ title: "Performance Observed Fixture" });
+      moviePlayer.getWebPlayerContextConfig = () => ({ jsUrl: "/player.js" });
+
+      const originalGetEntriesByType = performance.getEntriesByType.bind(performance);
+      performance.getEntriesByType = (type) => {
+        const entries = originalGetEntriesByType(type);
+        if (type !== "resource") {
+          return entries;
+        }
+
+        return entries.concat([
+          {
+            name: "https://rr1---sn-fixture.googlevideo.com/videoplayback?id=fixture-observed-id&n=live-token",
+            responseEnd: 1200,
+            transferSize: 1024,
+            encodedBodySize: 768,
+          },
+        ]);
+      };
+    </script>
+  `);
+}
+
 async function createServer() {
   return new Promise((resolve) => {
     const server = http.createServer((request, response) => {
@@ -263,6 +310,7 @@ async function createServer() {
         || requestUrl.startsWith("/media/adaptive-video.mp4")
         || requestUrl === "/media/adaptive-audio.m4a"
         || requestUrl === "/media/watch.mp4"
+        || requestUrl.startsWith("/media/performance-raw.mp4")
         || requestUrl === "/media/mixed-video.webm"
         || requestUrl === "/media/mixed-audio.m4a"
         || requestUrl === "/media/budget-video-large.mp4"
@@ -315,6 +363,12 @@ async function createServer() {
       if (requestUrl === "/shorts/watch-fixture") {
         response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
         response.end(watchFallbackFixture());
+        return;
+      }
+
+      if (requestUrl === "/shorts/performance-observed") {
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        response.end(performanceObservedFixture(origin));
         return;
       }
 
@@ -608,6 +662,11 @@ async function main() {
       mode: "direct",
       tracking: true,
       directUrlPart: "/media/watch.mp4",
+    }),
+    await runCase(page, `${origin}/shorts/performance-observed`, {
+      mode: "direct",
+      tracking: true,
+      directUrlPart: "n=live-token",
     }),
   ];
 

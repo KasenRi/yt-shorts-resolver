@@ -4,6 +4,7 @@
   const EXTENSION_SOURCE = "yt-shorts-resolver-content";
   const PAGE_SOURCE = "yt-shorts-resolver-page";
   const PLAYER_FETCH_TIMEOUT_MS = 8000;
+  const PERFORMANCE_URL_MAX_AGE_MS = 45000;
   const NO_DOWNLOADABLE_MEDIA = "No downloadable media streams found";
   const MAX_SINGLE_STREAM_BYTES = 256 * 1024 * 1024;
   const MAX_TOTAL_INPUT_BYTES = 384 * 1024 * 1024;
@@ -17,6 +18,10 @@
 
   function isDownloadableUrl(url) {
     return /^https?:/i.test(url || "") || /^data:/i.test(url || "");
+  }
+
+  function isGoogleVideoPlaybackUrl(url) {
+    return /^https:\/\/[^/]+\.googlevideo\.com\/videoplayback/i.test(url || "");
   }
 
   function sanitizeFilenamePart(value) {
@@ -866,6 +871,11 @@
       return null;
     }
 
+    const observedPayload = observedPlaybackPayload(candidates, title, strategy);
+    if (observedPayload) {
+      return observedPayload;
+    }
+
     const progressive = pickBestProgressive(candidates);
     const mergePair = pickBestMergePair(candidates);
 
@@ -908,6 +918,66 @@
     return /^https?:/i.test(currentSrc) ? currentSrc : "";
   }
 
+  function googleVideoIdFromUrl(url) {
+    try {
+      return new URL(url).searchParams.get("id") || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function performancePlaybackEntries() {
+    if (typeof performance?.getEntriesByType !== "function") {
+      return [];
+    }
+
+    const now = typeof performance.now === "function" ? performance.now() : 0;
+    return performance.getEntriesByType("resource")
+      .filter((entry) => isGoogleVideoPlaybackUrl(entry?.name))
+      .map((entry) => ({
+        url: entry.name,
+        id: googleVideoIdFromUrl(entry.name),
+        responseEnd: Number(entry.responseEnd || 0),
+        transferSize: Number(entry.transferSize || 0),
+        encodedBodySize: Number(entry.encodedBodySize || 0),
+      }))
+      .filter((entry) => {
+        if (!entry.id) {
+          return false;
+        }
+
+        if (!entry.responseEnd || !now) {
+          return true;
+        }
+
+        return now - entry.responseEnd <= PERFORMANCE_URL_MAX_AGE_MS;
+      })
+      .sort((left, right) => (
+        right.responseEnd - left.responseEnd
+        || right.transferSize - left.transferSize
+        || right.encodedBodySize - left.encodedBodySize
+      ));
+  }
+
+  function observedPlaybackUrl(candidates) {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return "";
+    }
+
+    const candidateIds = new Set(
+      candidates
+        .map((candidate) => googleVideoIdFromUrl(candidate.directUrl))
+        .filter(Boolean),
+    );
+
+    if (candidateIds.size === 0) {
+      return "";
+    }
+
+    const match = performancePlaybackEntries().find((entry) => candidateIds.has(entry.id));
+    return match?.url || "";
+  }
+
   function currentSrcPayload(url, title) {
     const container = /mime=video%2Fwebm/i.test(url) ? "webm" : "mp4";
     return {
@@ -919,6 +989,28 @@
       hasAudio: true,
       hasVideo: true,
       qualityLabel: "",
+      container,
+    };
+  }
+
+  function observedPlaybackPayload(candidates, title, strategy) {
+    const directUrl = observedPlaybackUrl(candidates);
+    if (!directUrl) {
+      return null;
+    }
+
+    const template = pickBestProgressive(candidates) || candidates.find((candidate) => candidate.hasVideo) || candidates[0] || null;
+    const container = template?.container === "webm" ? "webm" : "mp4";
+
+    return {
+      mode: "direct",
+      title,
+      filename: buildFilename(title, container === "webm" ? "webm" : "mp4"),
+      directUrl,
+      strategy: `${strategy}-performance`,
+      hasAudio: template?.hasAudio ?? true,
+      hasVideo: true,
+      qualityLabel: template?.qualityLabel || "",
       container,
     };
   }
